@@ -1,0 +1,428 @@
+/*********************************************************************
+ * Copyright (C) 2015, International Business Machines Corporation
+ * All Rights Reserved
+ ********************************************************************/
+
+#include <iostream>
+#include <fstream>
+#include "flann.h"
+#include <ctime>
+#include <vector>
+#include <omp.h>
+
+<%SPL::CodeGen::implementationPrologue($model);%>
+
+// Constructor
+MY_OPERATOR::MY_OPERATOR() {
+    minNN = 5;
+    step = 5;
+    maxNN = 25;
+    cols = -1;
+    rows = 0;
+    nthreads = 4;
+    DELTA = 1.0 / 100000.0; // Threshold value for use in the LOF calculation
+
+    debug = false; // false: do not print messages, true: print messages
+
+    algo = 1; // Eventually, may expose this option as a parameter
+              // 0: flann linear, 1: flann kmeans, 2: flann kd
+
+    // Now, let us read the user preference that is passed via the 
+    // operator parameters.
+    <% my $minNNParam = $model->getParameterByName("minNN");
+       my $maxNNParam = $model->getParameterByName("maxNN");
+       my $myStepParam = $model->getParameterByName("step");
+       my $threadParam = $model->getParameterByName("threads");
+
+       my $iport0 = $model->getInputPortAt(0);
+       my $iport1 = $model->getInputPortAt(1);
+       my $oport0 = $model->getOutputPortAt(0);
+
+       my $labelP0 = $iport0->getAttributeAt(0)->getName();
+       my $dataP0  = $iport0->getAttributeAt(1)->getName();
+
+       my $attra = $oport0->getAttributeAt(0)->getName();
+       my $attrb = $oport0->getAttributeAt(1)->getName();
+       my $attrc = $oport0->getAttributeAt(2)->getName();
+
+       if ($threadParam) {
+	   print ("nthreads = " . $threadParam->getValueAt(0)->getCppExpression() . ";\n");
+       }
+
+       if ($minNNParam) {
+	   print ("minNN = " . $minNNParam->getValueAt(0)->getCppExpression() . ";\n");
+       }
+
+       if ($maxNNParam) {
+	   print ("maxNN = " . $maxNNParam->getValueAt(0)->getCppExpression() . ";\n");
+       }
+
+       if ($myStepParam) {
+	   print ("step = " . $myStepParam->getValueAt(0)->getCppExpression() . ";\n");
+       }
+    %>    
+
+    // Basic parameter validation
+    if( !(step > 0) ) {
+	SPLAPPTRC(L_ERROR, "LOF requires step > 0.", "LOF_aspect");
+	SPL::Functions::Utility::shutdownPE();
+    }
+    if( !(nthreads >= 0) ) {
+	SPLAPPTRC(L_ERROR, "LOF requires threads >= 0.", "LOF_aspect");
+	SPL::Functions::Utility::shutdownPE();
+    }
+    if ( !(minNN >= 1 && maxNN >= minNN)) {
+	SPLAPPTRC(L_ERROR, "LOF requires 1 <= minNN <= maxNN.", "LOF_aspect");
+	SPL::Functions::Utility::shutdownPE();
+    }
+
+    // Add 1 to minNN, maxNN to account for the fact that FLANN will 
+    // include each point in its own NN query list.
+    minNN++;
+    maxNN++;
+
+    // This parameter defines the actual number of NN queried
+    // It is greater than maxNN to give some resiliency when repeated 
+    // distances occur.
+    nn = maxNN + std::min(maxNN, 20);
+}
+
+// Destructor
+MY_OPERATOR::~MY_OPERATOR() {
+    datavector.clear();
+}
+
+// Notify port readiness
+void MY_OPERATOR::allPortsReady() {
+}
+
+// Notify pending shutdown
+void MY_OPERATOR::prepareToShutdown() {
+}
+
+// Processing for source and threaded operators   
+void MY_OPERATOR::process(uint32_t idx) {
+}
+
+// Tuple processing for mutating ports 
+void MY_OPERATOR::process(Tuple & tuple, uint32_t port) {
+    if (port == 0) {
+	rows++;
+	IPort0Type const & ituple = static_cast<IPort0Type const&>(tuple);
+	rstring inLabel = ituple.get_<%=$labelP0%>();
+	list<float> indata = ituple.get_<%=$dataP0%>();
+
+	if (cols < 0) {
+	    cols = indata.size();
+	}
+
+	labelvector.push_back(inLabel); 
+	if(debug) std::cout << "lofbatch::process : " << inLabel
+	                    << " : indata = ";
+	for (int i=0; i < indata.size(); i++) {
+	    datavector.push_back(indata[i]);
+	    if(debug) std::cout << indata[i] << " ";
+	}
+	if(debug) std::cout << std::endl;
+    }
+}
+
+// Tuple processing for non-mutating ports
+void MY_OPERATOR::process(Tuple const & tuple, uint32_t port) {
+}
+
+// Punctuation processing
+void MY_OPERATOR::process(Punctuation const & punct, uint32_t port) {
+    if(port == 0 && punct==Punctuation::WindowMarker) {
+	if (debug) std::cout << "Receive window marker here " << std::endl;
+	if (debug) std::cout << "Datavector size:" << datavector.size() << ", rows:" << rows <<",cols:" << cols << std::endl;
+	if(rows <= nn) {
+	    // TODO: Potential bug in flann if too few rows so just return.
+	    // The rows will just be added to the next set which works
+	    // fine for the analytics.
+	    return;
+	}
+
+	LOF();
+	submit(punct, 0);
+    }
+}
+
+void  MY_OPERATOR::LOF() {
+    if (debug) {
+	std::cout << "Starting LOF @ time: " << std::time(0) << std::endl;
+    }
+
+    float* _data = &datavector[0];
+
+    //Generate the list of K-values to use for LOF
+    std::vector<int> KK;
+    int k = minNN;
+    while(k <= maxNN) {
+	KK.push_back(k);
+	k += step;
+    }
+
+    // Prepare pointers to keep indices and distances.  
+    // The cast prevents multiplication overflow.
+    int* indices = (int*) malloc(((int64)rows)*nn*sizeof(int));
+    float* dists = (float*) malloc(((int64)rows)*nn*sizeof(float));
+
+    if (!indices) {
+	std::cout << "Memory allocation for indices failed"<< std::endl;
+	exit(1);	
+    }
+
+    if (!dists) {
+	std::cout << "Memory allocation for dists failed"<< std::endl;
+	exit(1);
+    }
+
+    for(int i = 0; i < nn*rows; ++i) {
+    	*(indices+i) = 0;
+    	*(dists+i) = 0.0;
+    }
+
+    int* ind = indices;
+    float* dis = dists;
+
+    if (algo == 0 || algo == 1 || algo == 2) {
+	struct FLANNParameters p;
+	float speedup;
+	flann_index_t index_id;
+	p = DEFAULT_FLANN_PARAMETERS;
+	p.log_level = FLANN_LOG_INFO;
+	p.sorted = 1; // Need this to make sure the output is sorted, 
+	              // even if k > 250.
+	p.cores = nthreads;
+
+	if (algo == 0) {
+	    p.algorithm = FLANN_INDEX_LINEAR;
+	} else if (algo == 1) {
+	    // KMeans Tree Params
+	    p.algorithm = FLANN_INDEX_KMEANS;
+	    p.centers_init = FLANN_CENTERS_RANDOM;
+	    p.iterations = 4;
+	    p.cb_index = 0.0;
+	    p.checks = max(200, 5*nn);
+	} else {
+	    // KD Tree Params
+	    p.algorithm = FLANN_INDEX_KDTREE;
+	    p.trees = 32;
+	    p.checks = max(200, 200*nn);	
+	}
+
+	// Make index and do search with patched FLANN
+	if (debug) {
+	    std::cout << "Building FLANN Index @ time: " << 
+	        std::time(0) << std::endl;
+	}
+
+	index_id = flann_build_index(_data, rows, cols, &speedup, &p);
+
+	if (debug) {
+	    std::cout << "Finding FLANN KNN @ time: " << std::time(0) << 
+	        std::endl;
+        }
+
+	flann_find_nearest_neighbors_index(index_id, _data, rows, 
+	                                   indices, dists, nn, &p);
+
+	flann_free_index(index_id, &p);
+    }
+
+    if (debug) {
+        std::cout << "Calculate LOF @ time: " << std::time(0) << std::endl;
+    }
+
+    std::vector<Item*>allitems;
+    for (int i=0;i<rows;++i) {
+	Item *tmp = new Item(nn,i);
+	tmp->setdata(dis,ind,nn);
+
+	ind += nn;
+	dis += nn;
+	allitems.push_back(tmp);
+    }
+
+    // Initialize the combiner.
+    std::vector<float> sumLOF;
+    for (int i=0; i < allitems.size(); i++) {
+	sumLOF.push_back(0);
+    }
+
+    // Run for each kk, and sum the normalized lof
+    for(int i = 0; i < KK.size(); i++) {
+	if (KK[i] <= maxNN) {
+	    std::vector<float> v = doOneK(KK[i], allitems);
+	    for (int j=0; j < v.size(); j++){
+		sumLOF[j] += v[j];	
+	    }
+	}
+    }
+
+    // Take average normalized LOF scores, keep the original data row index 
+    // for verification.
+    std::vector<CompactItem> items;
+    for (int i=0; i < allitems.size(); i++){
+	CompactItem ci;
+	ci.label = labelvector[i];
+	ci.datarowidx = i;
+	ci.normalizedlof = sumLOF[i];
+	items.push_back(ci);
+    }
+
+    float maxscore = -1.0;
+    for (int i = 0; i < allitems.size(); i++){
+	if (sumLOF[i] > maxscore) {
+	    maxscore = sumLOF[i];
+	}
+    }
+
+    // Final normalization
+    for (int i=0; i < items.size(); i++){
+	items[i].normalizedlof = items[i].normalizedlof / maxscore;	
+    }
+
+    if (debug) {
+        std::cout << "Sort and Send @ time: " << std::time(0) << std::endl;
+    }
+
+    sort(items.begin(), items.end(), cmp);
+
+    for (int i=0; i < items.size(); i++) {
+	OPort0Type outTuple;
+	if (debug) std::cout << "Creating output vector: " << i << std::endl;
+	outTuple.set_<%=$attra%>(items[i].label);
+	outTuple.set_<%=$attrb%>(items[i].normalizedlof);
+
+	std::vector<float> outdata;
+	for(int j=0; j< cols; j++) {
+	    outdata.push_back(datavector[(items[i].datarowidx * cols) + j]); 
+	    if (debug) {
+	        std::cout << "  Entry " << j << " from row " <<
+		items[i].datarowidx * cols << " value = " << 
+		    outdata[j] << std::endl;
+            }
+	}
+	outTuple.set_<%=$attrc%>(outdata);
+	submit(outTuple,0);
+    }
+
+    // Clean up
+    for(int i=0;i<allitems.size();i++) {
+	delete allitems[i];
+    }
+
+    allitems.clear();
+    items.clear();
+    sumLOF.clear();
+    KK.clear();
+    free(indices);
+    free(dists); 
+    datavector.clear();
+    rows = 0;
+    cols = -1;
+
+    if (debug) 
+        std::cout << "LOF Complete @ time: " << std::time(0) << std::endl;
+}
+
+std::vector<float>  MY_OPERATOR::doOneK(int kk, std::vector<Item*> allitems){
+    // Compute the ilrd (actually lrd now, but we won't change the 
+    // variable names for now).
+    float eps = 1.0/DELTA;
+#pragma omp parallel num_threads(nthreads)
+    {
+#pragma omp for schedule(static)
+	for(int i=0;i<allitems.size();i++){
+	    // Since ilrd, lof are associated with allitems[i], they 
+	    // need to be zeroed for every call to doOneK.
+	    allitems[i]->ilrd = 0;
+
+	    for(int m=1;m<kk;m++){ //first element is itself 
+		int index = allitems[i]->smindex[m];
+		float tmp = allitems[index]->smdist[kk-1];//Kdistance of item B
+
+		// FLANN returns the Euclidean (L2) distance squared.
+		allitems[i]->ilrd += sqrt(max(tmp,allitems[i]->smdist[m]));
+	    }
+
+	    // In the extended strategy, we want to continue beyond 
+	    // kk elements, as long as the distances are the same.
+	    int id = kk;
+	    float dist = allitems[i]->smdist[kk-1];
+	    while( (id < nn) && (allitems[i]->smdist[id] == dist) ) {
+		int index = allitems[i]->smindex[id];
+		float tmp = allitems[index]->smdist[kk-1];
+
+		allitems[i]->ilrd += sqrt( max(tmp,dist) );
+		id++;
+	    }
+	    id--; // The actual number of neighbors considered (because 
+	          // index 0 is the point itself and ignored).
+
+	    if (allitems[i]->ilrd < DELTA*id) {
+		allitems[i]->ilrd = eps;
+	    } else {
+		allitems[i]->ilrd = id / allitems[i]->ilrd;
+	    }
+	}
+
+    } // end of openmp section 1
+
+    // Compute the LOF	
+#pragma omp parallel num_threads(nthreads)
+    {
+#pragma omp for schedule(static)
+	for(int i=0;i<allitems.size();i++){
+	    // Since ilrd, lof are associated with allitems[i], they 
+	    // need to be zeroed for every call to doOneK.
+	    allitems[i]->lof = 0;
+	    for(int m=1;m<kk;m++){ //first element is itself
+		int index = allitems[i]->smindex[m];
+		float tmp = allitems[index]->ilrd;
+
+		allitems[i]->lof += tmp;
+	    }
+
+	    // In the extended strategy, we want to continue beyond kk
+	    // elements, as long as the distances are the same.
+	    int id = kk;
+	    float dist = allitems[i]->smdist[kk-1];
+	    while( (id < nn) && (allitems[i]->smdist[id] == dist) ) {
+		int index = allitems[i]->smindex[id];
+		float tmp = allitems[index]->ilrd;
+
+		allitems[i]->lof += tmp;
+		id++;
+	    }
+
+	    // The actual number of neighbors considered (because index 0 
+	    // is the point itself and ignored).
+	    id--;
+
+	    allitems[i]->lof /= allitems[i]->ilrd;
+	    // Divide by #neighbors is unnecessary if the scores are normalized
+	    allitems[i]->lof /= id;
+	}
+    } // End of openmp section 2
+
+    double max_score=0;
+    for (int i = 0; i < allitems.size(); ++i) {
+	if (max_score < (allitems[i]->lof)) max_score = allitems[i]->lof;
+    }
+
+    //normalize lof score
+    std::vector<float> retLOF;
+    for (int i=0; i< allitems.size(); i++){
+	float normalizedlof = (allitems[i]->lof) / max_score;
+	retLOF.push_back(normalizedlof);
+    }
+
+    return retLOF;
+}
+
+
+<%SPL::CodeGen::implementationEpilogue($model);%>
+

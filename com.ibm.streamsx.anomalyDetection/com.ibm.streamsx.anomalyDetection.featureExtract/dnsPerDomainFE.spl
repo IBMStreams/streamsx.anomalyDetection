@@ -1,0 +1,120 @@
+/*********************************************************************
+ * Copyright (C) 2015, International Business Machines Corporation
+ * All Rights Reserved
+ ********************************************************************/
+
+/*
+ * Create a simple feature vector of directly extracted information from 
+ * DNS records. 
+ */
+
+namespace com.ibm.streamsx.anomalyDetection.featureExtract; 
+
+// Return the top two levels of domain name.
+rstring getDomainFromHostName(rstring hostname) {
+    mutable list<rstring> tokens = tokenize(hostname, ".", false);
+    if (size(tokens) > 2){
+	mutable rstring domain = tokens[size(tokens)-2]+"."+tokens[size(tokens)-1];
+	return domain;
+    }
+    return hostname;
+}
+
+public composite dnsPerDomainFE(output Out0; input  In0) {
+    param
+      // Maximum number of features that are aggregated by domain.
+      // Once this number is reached, a set of per domain entities is 
+      // sent downstream from the aggregation for additional processing. 
+      expression<uint32> $maxFeatureRecord: 64u; // Unit test value
+      // expression<uint32> $maxFeatureRecord: 1000000u; 
+
+    type
+        // This is a very simple feature set for DNS data.
+        DNSFeaturePerDomain=
+	   rstring domain,
+	   int32   totalReq,
+	   int32   numIP,
+	   int32   numUniqHost;
+
+    graph
+    stream<rstring domain, uint64 responseIP, int32 requestID, 
+           uint64 clientAddress>  PreProcess = Custom(In0 as inPort0) {
+	logic
+	    state:{
+		mutable uint32 i = 0u;
+		mutable rstring questionDomain; 
+	    }
+
+	onTuple inPort0:{
+	    questionDomain = lower(getDomainFromHostName(inPort0.questionName));
+ 	    // printString("dnsPerDomainFE preprocess: " + questionDomain + 
+	    //             " " + (rstring)inPort0.requestIdentifier +
+	    // 		" " + (rstring)inPort0.dstAddress);
+	    for(uint64 ip in inPort0.answerAddresses) {
+	    	// printString(" : " + (rstring)ip); 
+		submit({domain = questionDomain, 
+			responseIP = ip,
+			requestID = (int32)inPort0.requestIdentifier,
+			clientAddress=inPort0.dstAddress}, PreProcess);
+	    }
+	    // printString("\n"); 
+            ++i;
+
+	    if ((i%500000u) == 0u) {
+		printStringLn("dnsPerDomainFE: record processed: " + 
+		              (rstring)i);
+	    }
+	    if (i == $maxFeatureRecord) {
+		printStringLn("dnsPerDomainFE: maxFeatureRecord reached: " + 
+		              (rstring)i);
+		submit(Sys.WindowMarker, PreProcess);
+		i = 0u;
+	    }
+	}
+
+	onPunct inPort0: {
+            submit(Sys.WindowMarker, PreProcess);
+        }
+
+	config
+	    threadedPort : queue(inPort0, Sys.Wait);
+	    placement : partitionColocation("dnsPerDomainFE"); 
+    }
+
+    stream<DNSFeaturePerDomain> CreateFeaturePerDomain=Aggregate(PreProcess) {
+	window
+	    PreProcess: tumbling, punct();
+	param
+	    groupBy: domain;
+	output
+	    CreateFeaturePerDomain:
+	        domain=PreProcess.domain,
+	        totalReq=CountDistinct(PreProcess.requestID),
+	        numIP=Count(),
+	        numUniqHost=CountDistinct(PreProcess.clientAddress);
+	config placement : partitionColocation("dnsPerDomainFE"); 
+    }
+
+    stream<rstring domain, list<float32> featureVector> Out0 = 
+        Custom(CreateFeaturePerDomain) {
+	    logic
+		state: {
+		    mutable uint32 i = 0u;
+		}
+
+		onTuple CreateFeaturePerDomain: {
+		    mutable list<float32> l = [];
+		    appendM(l,(float32)CreateFeaturePerDomain.totalReq);
+		    appendM(l,(float32)CreateFeaturePerDomain.numIP);
+		    appendM(l,(float32)CreateFeaturePerDomain.numUniqHost);
+		    submit({domain = CreateFeaturePerDomain.domain, 
+		            featureVector=l}, Out0);
+		    ++i;
+		}
+	        onPunct CreateFeaturePerDomain: { 
+	            submit(Sys.WindowMarker, Out0);
+		    i = 0u;
+	        }
+	    config placement : partitionColocation("dnsPerDomainFE"); 
+    }
+}
