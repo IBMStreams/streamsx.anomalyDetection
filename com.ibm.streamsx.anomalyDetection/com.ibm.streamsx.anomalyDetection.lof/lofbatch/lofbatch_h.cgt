@@ -1,0 +1,146 @@
+/*********************************************************************
+ * Copyright (C) 2015, International Business Machines Corporation
+ * All Rights Reserved
+ ********************************************************************/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <vector>
+#include <string>
+#include <iostream>
+#include <sstream>
+#include <fstream>
+
+<%SPL::CodeGen::headerPrologue($model);%>
+
+class Item;
+
+class MY_OPERATOR : public MY_BASE_OPERATOR {
+    public:
+	MY_OPERATOR();
+	virtual ~MY_OPERATOR(); 
+
+	// Notify port readiness
+	void allPortsReady(); 
+
+	// Notify pending shutdown
+	void prepareToShutdown(); 
+
+	// Processing for source and threaded operators   
+	void process(uint32_t idx);
+
+	// Tuple processing for mutating ports 
+	void process(Tuple & tuple, uint32_t port);
+
+	// Tuple processing for non-mutating ports
+	void process(Tuple const & tuple, uint32_t port);
+
+	void LOF();
+	std::vector<float> doOneK(int kk, std::vector<Item*> allitems);
+
+	// Punctuation processing
+	void process(Punctuation const & punct, uint32_t port);
+
+    private:
+	int32 minNN;
+	int32 maxNN;
+	int32 step;
+	int32 nn;
+	int32 nthreads;
+	int32 cols;
+	int32 rows;
+	boolean debug;
+	int algo;    // Indicate the indexing algorithm to use.
+	float DELTA; // Guard check for too small ilrd and lof scores.
+
+	std::vector<float> datavector;
+	std::vector<rstring> labelvector;
+}; 
+
+class CompactItem {
+    public:
+	int datarowidx;
+	rstring label;
+	float normalizedlof;
+};
+
+bool cmp(const CompactItem &c1, const CompactItem &c2) {
+    if(c1.normalizedlof > c2.normalizedlof) {
+	return true;
+    }
+    return false;
+}
+
+float max(float a, float b) {
+    if (a > b) return a;
+    return b;
+}
+
+class Item {
+    public:
+	int *smindex;
+	float *smdist;
+	float ilrd;
+	int k;
+	double lof;
+	Item(int nn, int datarowidx_t){
+	    k = nn;
+	    smindex = new int[k];
+	    for(int i=0; i<k; ++i) smindex[i] = 0;
+	    if (!smindex){
+		std::cout << "smindex needs to be allocated\n";
+		return;	
+	    } 
+	    smdist = new float[k]; 
+	    for(int i=0; i<k; ++i) smdist[i] = 0.0;
+	    if (!smdist){
+		std::cout << "smdist needs to be allocated\n";
+		return;	
+	    } 
+	    ilrd = 0; 
+	    lof = 0;
+	};
+
+	void setdata(float* dists, int* index, int nn) {
+	    if ((!smindex) || (!smdist)){
+		std::cout << "smindex and smdist need to be allocated\n";
+		return;	
+	    } 
+	    if (k != nn){
+		std::cout << "Different values:nn="<<nn<<",k="<<k<<"\n";
+		return;
+	    }
+
+	    // Note: here we start from 1 since the first elem is itself.
+	    for (int i=0; i<nn; i++){
+		smdist[i]=*(dists+i);
+		smindex[i]=*(index+i);
+	    }
+	}
+
+	void sort() {
+	    float t;
+	    int id;
+	    for (int i=0; i < k-1; i++){
+		for (int j=0; j < k-1; j++){
+		    if (smdist[j] > smdist[j+1]){
+			t = smdist[j];
+			smdist[j]=smdist[j+1];
+			smdist[j+1] = t;
+
+			id = smindex[j];
+			smindex[j] = smindex[j+1];
+			smindex[j+1] = id;
+		    }
+		}
+	    }
+	}
+
+	~Item(){
+	    delete [] smindex; 
+	    delete [] smdist; 
+	};
+};
+
+<%SPL::CodeGen::headerEpilogue($model);%>
+

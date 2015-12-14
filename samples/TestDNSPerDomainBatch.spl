@@ -1,0 +1,77 @@
+/*********************************************************************
+ * Copyright (C) 2015, International Business Machines Corporation
+ * All Rights Reserved
+********************************************************************/
+
+use com.ibm.streamsx.anomalyDetection.featureExtract::* ;
+use com.ibm.streamsx.anomalyDetection.lof::*;
+
+/*
+ * Example to ingest DNS data and feed it into downstream operators 
+ * that extract the desired features from the data and then score
+ * it in order to find outlier points.
+ *
+ * This example uses a simple CSV file with data representative of DNS
+ * records for the input data stream.
+ */
+
+public composite TestDNSPerDomainBatch {
+    param
+	expression<rstring> $dataDir :getSubmissionTimeValue("dataDir");  
+
+    // Simplifed subset of a DNS record which is used in our sample
+    // input file & subsequent processing.
+    type DNSMessage_t = 
+        uint64 captureTime, // when the message was captured, 
+	                    //in seconds since the Unix epoch
+	uint64 srcAddress,          // IP address of sender
+	uint16 srcPort,              // UDP port of sender
+	uint64 dstAddress,           // IP address of receiver
+	uint16 dstPort,              // UDP port of receiver
+	uint16 requestIdentifier,    // request identifier assigned 
+	                             // by requester
+	rstring questionName,        // domain name specified in 
+	                             // question section
+	uint16 questionType,         // type code specified in
+	                             // question section
+	uint16 responseFlag,         // 'false' for requests, 
+	                             // 'true' for responses
+	uint16 responseCode,         // error code for responses
+	rstring answerCanonical,     // canonical domain name, if 
+	                             // 'questionName' is an alias
+	list<uint64> answerAddresses;// list of IP addresses for 
+	                             // 'questionName'
+
+    graph
+	// Read in input data files from the specified directory.
+	stream<rstring fileName> readDirDNSData = DirectoryScan() {
+	    param
+		directory : $dataDir ; 
+	}
+
+        stream<DNSMessage_t> dnsFile = FileSource(readDirDNSData) {
+		param
+			format : csv;
+	}
+
+	// Extract useful features from the input DNS data.
+	stream<rstring domain, list<float32> featureVector> featuresStream = 
+	    dnsPerDomainFE(dnsFile) {
+	}
+
+	// Process the feature vectors with the LOF anomaly detector.
+	stream <rstring label, float32 scoreLOF, list<float32> features> lofStream = 
+	    lofbatch(featuresStream) {
+	    config
+		threadedPort : queue(featuresStream, Sys.Wait);
+	}
+
+	// Output the scored data to a file.
+	() as Out_LOF = FileSink(lofStream) {
+	    param
+		file : "lof_scores_{id}.out";
+                quoteStrings : false;
+                closeMode : punct;
+                flush : 1u;
+	}
+}
