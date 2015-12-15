@@ -2,3 +2,4 @@
 # do not want anything in it to be stored into the
 # git repository, other than this file.
 !.gitignore
+*.out
