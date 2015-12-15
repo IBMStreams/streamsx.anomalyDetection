@@ -8,10 +8,7 @@
           <cmn:description></cmn:description>
           <cmn:managedLibrary>
             <cmn:lib>flann</cmn:lib>
-            <cmn:libPath>../../impl/lib</cmn:libPath>
-            <cmn:includePath>../impl/include/flann-1.8.4-src/src/cpp/flann</cmn:includePath>
-            <cmn:includePath>../impl/include/flann-1.8.4-src/src/cpp</cmn:includePath>
-	    <cmn:command></cmn:command>
+            <cmn:command>../../impl/bin/archLevel</cmn:command>
           </cmn:managedLibrary>
         </library>
       </libraryDependencies>
