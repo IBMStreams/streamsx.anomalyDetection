@@ -10,16 +10,6 @@
 
 namespace com.ibm.streamsx.anomalyDetection.featureExtract; 
 
-// Return the top two levels of domain name.
-rstring getDomainFromHostName(rstring hostname) {
-    mutable list<rstring> tokens = tokenize(hostname, ".", false);
-    if (size(tokens) > 2){
-	mutable rstring domain = tokens[size(tokens)-2]+"."+tokens[size(tokens)-1];
-	return domain;
-    }
-    return hostname;
-}
-
 public composite dnsPerDomainFE(output Out0; input  In0) {
     param
       // Maximum number of features that are aggregated by domain.
