@@ -321,6 +321,7 @@ void  MY_OPERATOR::LOF() {
     free(indices);
     free(dists); 
     datavector.clear();
+    labelvector.clear();
     rows = 0;
     cols = -1;
 
